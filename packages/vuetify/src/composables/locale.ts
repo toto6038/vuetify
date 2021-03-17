@@ -1,5 +1,5 @@
 // Utilities
-import { computed, inject, provide, ref } from 'vue'
+import { computed, inject, isRef, provide, ref } from 'vue'
 
 import enUS from '@/locale/en'
 
@@ -8,23 +8,29 @@ import type { InjectionKey, Ref } from 'vue'
 import { getObjectValueByPath } from '@/util'
 import { consoleError, consoleWarn } from '@/util/console'
 
+type CustomTranslateFunction = (key: string, locale: string, params: unknown[]) => string
+
 export interface LocaleProvide {
+  isRtl: Ref<boolean>
   locales: Ref<Record<string, Locale>>
-  current: Ref<string>
-  fallback: Ref<string>
+  currentLocale: Ref<string>
+  fallbackLocale: Ref<string>
+  customTranslateFunction?: CustomTranslateFunction
   translate: (key: string, ...params: unknown[]) => string
 }
 
-// TODO: explicit definition of locale?
 export interface Locale {
-  [key: string]: Locale | string
+  rtl?: boolean
+  badge?: {
+    label?: string
+  }
 }
 
 export interface LocaleOptions {
   defaultLocale?: string
   fallbackLocale?: string
   locales?: Record<string, Locale>
-  translate?: () => void
+  translate?: CustomTranslateFunction
 }
 
 export const VuetifyLocaleSymbol: InjectionKey<LocaleProvide> = Symbol.for('vuetify:locale')
@@ -38,8 +44,17 @@ const replace = (str: string, params: unknown[]) => {
   })
 }
 
-const createTranslateFunction = (current: Ref<string>, fallback: Ref<string>, locales: Ref<Record<string, Locale>>) => {
+const createTranslateFunction = (
+  current: Ref<string>,
+  fallback: Ref<string>,
+  locales: Ref<Record<string, Locale>>,
+  customTranslateFunction?: CustomTranslateFunction
+) => {
   return (key: string, ...params: unknown[]) => {
+    if (customTranslateFunction) {
+      return customTranslateFunction(key, current.value, params)
+    }
+
     if (!key.startsWith(LANG_PREFIX)) {
       return replace(key, params)
     }
@@ -51,29 +66,66 @@ const createTranslateFunction = (current: Ref<string>, fallback: Ref<string>, lo
     let str: string = getObjectValueByPath(currentLocale, shortKey, null)
 
     if (!str) {
-      consoleWarn(`Translation key "${shortKey}" not found in "${current.value}", trying fallback locale`)
+      consoleWarn(`Translation key "${key}" not found in "${current.value}", trying fallback locale`)
       str = getObjectValueByPath(fallbackLocale, shortKey, null)
     }
 
     if (!str) {
-      consoleError(`Translation key "${shortKey}" not found in fallback`)
-      str = shortKey
+      consoleError(`Translation key "${key}" not found in fallback`)
+      str = key
+    }
+
+    if (typeof str !== 'string') {
+      consoleError(`Translation key "${key}" has a non-string value`)
+      str = key
     }
 
     return replace(str, params)
   }
 }
 
-export function createLocale (options?: LocaleOptions) {
-  const current = ref(options?.defaultLocale ?? 'en-US')
-  const fallback = ref(options?.fallbackLocale ?? 'en-US')
-  const locales = ref(options?.locales ?? { 'en-US': enUS })
+type MaybeRef<T> = Ref<T> | T
+
+function wrapInRef <T> (value: MaybeRef<T>): Ref<T> {
+  if (isRef(value)) {
+    return value
+  }
+
+  return ref(value) as Ref<T>
+}
+
+export function createLocaleFromOptions (options?: LocaleOptions) {
+  return createLocale({
+    currentLocale: options?.defaultLocale ?? 'en-US',
+    fallbackLocale: options?.fallbackLocale ?? 'en-US',
+    locales: options?.locales ?? { 'en-US': enUS },
+    customTranslateFunction: options?.translate,
+  })
+}
+
+export function createLocale (options: {
+  currentLocale: MaybeRef<string>
+  fallbackLocale: MaybeRef<string>
+  locales: MaybeRef<Record<string, Locale>>
+  customTranslateFunction?: CustomTranslateFunction
+}) {
+  const currentLocale = wrapInRef(options.currentLocale)
+  const fallbackLocale = wrapInRef(options.fallbackLocale)
+  const locales = wrapInRef(options.locales)
+  const customTranslateFunction = options.customTranslateFunction
+
+  const computedLocale = computed(() => {
+    return locales.value[currentLocale.value] ?? locales.value[fallbackLocale.value]
+  })
+  const isRtl = computed(() => !!computedLocale.value?.rtl)
 
   return {
+    isRtl,
     locales,
-    current,
-    fallback,
-    translate: createTranslateFunction(current, fallback, locales),
+    currentLocale,
+    fallbackLocale,
+    customTranslateFunction,
+    translate: createTranslateFunction(currentLocale, fallbackLocale, locales, customTranslateFunction),
   }
 }
 
@@ -88,15 +140,16 @@ export function useLocale () {
 export function provideLocale (props: { locale?: string, fallbackLocale?: string }) {
   const locale = useLocale()
 
-  const current = computed(() => props.locale ?? locale.current.value)
-  const fallback = computed(() => props.fallbackLocale ?? locale.fallback.value)
+  const currentLocale = computed(() => props.locale ?? locale.currentLocale.value)
+  const fallbackLocale = computed(() => props.fallbackLocale ?? locale.fallbackLocale.value)
 
-  provide(VuetifyLocaleSymbol, {
+  const newLocale = createLocale({
+    currentLocale,
+    fallbackLocale,
     locales: locale.locales,
-    current,
-    fallback,
-    translate: createTranslateFunction(current, fallback, locale.locales),
   })
 
-  return { current }
+  provide(VuetifyLocaleSymbol, newLocale)
+
+  return newLocale
 }
